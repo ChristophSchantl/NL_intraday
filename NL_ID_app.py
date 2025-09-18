@@ -250,37 +250,49 @@ def make_features(df: pd.DataFrame, lookback_bars: int, horizon_bars: int) -> pd
     feat["FutureRet"] = feat["Close"].shift(-horizon_bars) / feat["Close"] - 1
     return feat
 
-def predict_walk_forward(
-    feat: pd.DataFrame,
-    X_cols: List[str],
-    threshold: float,
-    model_params: dict,
-    refit_every: int = 200,
-    min_train: int = 200,
-    calibrate: bool = True
-) -> pd.DataFrame:
+def predict_walk_forward(...):
     probs = np.full(len(feat), np.nan)
-    start = max(min_train, X_cols.__len__() + 10)
+    start = max(min_train, len(X_cols) + 10)
     scaler = None
     model = None
+    base = GradientBoostingClassifier(**model_params)
+
     for i in range(start, len(feat)):
         if (i == start) or (i % refit_every == 0):
             hist = feat.iloc[:i].dropna(subset=X_cols + ["FutureRet"]).copy()
+            # Guard: Inf/NaN entfernen
+            hist[X_cols] = hist[X_cols].replace([np.inf, -np.inf], np.nan)
+            hist = hist.dropna(subset=X_cols + ["FutureRet"])
             if len(hist) < start:
                 continue
+
             y = (hist["FutureRet"] > threshold).astype(int).values
-            scaler = StandardScaler().fit(hist[X_cols].values)
-            base = GradientBoostingClassifier(**model_params)
+            if len(np.unique(y)) < 2:
+                # keine Varianz → kein Refit
+                probs[i] = probs[i-1] if i > 0 and np.isfinite(probs[i-1]) else 0.5
+                continue
+
+            Xs = hist[X_cols].values
+            scaler = StandardScaler().fit(Xs)
+            Xs = scaler.transform(Xs)
+
             if calibrate:
-                model = CalibratedClassifierCV(base, cv=3, method="isotonic")
-                model.fit(scaler.transform(hist[X_cols].values), y)
+                try:
+                    model = CalibratedClassifierCV(base, cv=3, method="isotonic")
+                    model.fit(Xs, y)
+                except ValueError:
+                    # Fallback ohne Kalibrierung
+                    model = base.fit(Xs, y)
             else:
-                model = base.fit(scaler.transform(hist[X_cols].values), y)
+                model = base.fit(Xs, y)
+
         if model is not None and scaler is not None:
             x_i = scaler.transform(feat.iloc[[i]][X_cols].values)
             probs[i] = float(model.predict_proba(x_i)[0, 1])
+
     feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
     return feat
+
 
 def backtest_next_bar(
     df: pd.DataFrame,
@@ -410,7 +422,7 @@ def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float
     sharpe = (rets.mean() * np.sqrt(ann)) / (rets.std() + eps) if len(rets) else np.nan
     dd = (df_bt["Equity_Net"] - df_bt["Equity_Net"].cummax()) / df_bt["Equity_Net"].cummax()
     max_dd = dd.min() * 100 if not dd.empty else np.nan
-    calmar = (net_ret/100) / abs(max_dd/100) if (max_dd is not np.nan and max_dd < 0) else np.nan
+    calmar = (net_ret/100) / abs(max_dd/100) if np.isfinite(max_dd) and max_dd < 0 else np.nan
     gross_ret = (df_bt["Equity_Gross"].iloc[-1] / max(eps, init_cap) - 1) * 100
     bh_ret = (df_bt["Close"].iloc[-1] / max(eps, df_bt["Close"].iloc[0]) - 1) * 100
     fees = sum(t.get("Fees",0.0) for t in trades)
@@ -621,8 +633,9 @@ with st.expander("Optimizer – Random Search + Walk-Forward (Intraday)", expand
             horizon  = rng.randrange(hz_lo, hz_hi+1, 1),
             thresh   = rng.uniform(thr_lo, thr_hi),
             entry    = rng.uniform(en_lo, en_hi),
-            exit     = rng.uniform(ex_lo, en_hi)  # obere Schranke = en_hi, validieren unten
+            exit     = rng.uniform(ex_lo, ex_hi),   # ← hier war der Bug
         )
+
 
     if st.button("🔎 Suche starten", type="primary", use_container_width=True):
         import random
