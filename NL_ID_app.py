@@ -589,6 +589,114 @@ with st.spinner(f"Lade Intraday-Daten (RTH) für {len(TICKERS)} Ticker …"):
 if not price_map:
     st.stop()
 
+
+# ─────────────────────────────────────────────────────────────
+# 🧭 Parameter-Optimierung (Intraday only)
+# ─────────────────────────────────────────────────────────────
+st.subheader("🧭 Parameter-Optimierung (Intraday)")
+with st.expander("Optimizer – Random Search + Walk-Forward (Intraday)", expanded=False):
+    n_trials = st.number_input("Trials", 10, 2000, 120, step=10)
+    seed = st.number_input("Seed", 0, 10_000, 42)
+    lambda_trades = st.number_input("Penalty λ pro Trade", 0.0, 1.0, 0.02, step=0.005)
+    min_trades_req = st.number_input("Min. Trades gesamt (Filter)", 0, 10000, 5, step=1)
+    folds = st.slider("Walk-Forward Folds", 2, 5, 3, step=1)
+
+    lb_lo, lb_hi = st.slider("Lookback (Bars) Range", 10, 5000, (60, 240), step=10)
+    hz_lo, hz_hi = st.slider("Horizon (Bars) Range", 1, 1000, (10, 40), step=1)
+    thr_lo, thr_hi = st.slider("Threshold Target Range", 0.0, 0.10, (0.010, 0.050), step=0.001, format="%.3f")
+    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.55, 0.85), step=0.01)
+    ex_lo, ex_hi = st.slider("Exit Prob Range",  0.0, 1.0, (0.30, 0.60), step=0.01)
+
+    def _split_walk_forward(df: pd.DataFrame, k: int) -> List[pd.DataFrame]:
+        """k zeitlich fortlaufende Folds (ohne Überschneidung) – robust bei 10-Tage-Fenster."""
+        n = len(df)
+        if n < 80:  # zu wenig Bars für sinnvolle Splits
+            return [df]
+        cuts = np.linspace(0, n, k+1, dtype=int)
+        return [df.iloc[cuts[i]:cuts[i+1]] for i in range(k) if cuts[i+1]-cuts[i] >= 40]
+
+    def _sample(rng):
+        return dict(
+            lookback = rng.randrange(lb_lo, lb_hi+1, 10),
+            horizon  = rng.randrange(hz_lo, hz_hi+1, 1),
+            thresh   = rng.uniform(thr_lo, thr_hi),
+            entry    = rng.uniform(en_lo, en_hi),
+            exit     = rng.uniform(ex_lo, en_hi)  # obere Schranke = en_hi, validieren unten
+        )
+
+    if st.button("🔎 Suche starten", type="primary", use_container_width=True):
+        import random
+        rng = random.Random(int(seed))
+        rows, best = [], None
+        prog = st.progress(0.0)
+
+        # verwende bereits geladene Intraday-Daten:
+        feasible_tickers = [tk for tk, df in price_map.items() if isinstance(df, pd.DataFrame) and len(df) >= 80]
+        if not feasible_tickers:
+            st.warning("Zu wenige Intraday-Daten für die Optimierung.")
+        else:
+            for t in range(int(n_trials)):
+                p = _sample(rng)
+                if p["exit"] >= p["entry"]:
+                    prog.progress((t+1)/n_trials); continue
+
+                sharps, trades_total, folds_done = [], 0, 0
+                for tk in feasible_tickers:
+                    df = price_map[tk]
+                    for fold_df in _split_walk_forward(df, int(folds)):
+                        try:
+                            _, _, trades, mets = make_features_and_train_intraday(
+                                fold_df, int(p["lookback"]), int(p["horizon"]), float(p["thresh"]),
+                                MODEL_PARAMS, float(p["entry"]), float(p["exit"]),
+                                min_hold_bars=int(MIN_HOLD_BARS), cooldown_bars=int(COOLDOWN_BARS)
+                            )
+                            sharps.append(mets["Sharpe-Ratio"])
+                            trades_total += int(mets["Number of Trades"])
+                            folds_done += 1
+                        except Exception:
+                            pass
+
+                if folds_done == 0:
+                    prog.progress((t+1)/n_trials); continue
+
+                sharpe_avg = float(np.nanmean(sharps)) if len(sharps) else float("nan")
+                # Scoring: ØSharpe minus Trades-Penalty (pro Fold/Ticker normiert)
+                denom = max(1, folds_done)
+                score = sharpe_avg - float(lambda_trades) * (trades_total / denom)
+
+                rec = dict(trial=t, score=score, sharpe_avg=sharpe_avg,
+                           trades=trades_total, **p)
+                rows.append(rec)
+                if (best is None) or (score > best["score"]):
+                    best = rec
+                prog.progress((t+1)/n_trials)
+
+            if not rows:
+                st.warning("Keine gültigen Kandidaten gefunden.")
+            else:
+                df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
+                mask = pd.to_numeric(df_res["trades"], errors="coerce").fillna(0).astype(int) >= int(min_trades_req)
+                df_show = df_res.loc[mask].copy() if mask.any() else df_res.copy()
+
+                st.success(f"Beste Parameter: "
+                           f"Score={best['score']:.3f} • Sharpe={best['sharpe_avg']:.2f} • Trades={best['trades']}")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Lookback", int(best["lookback"]))
+                c2.metric("Horizon",  int(best["horizon"]))
+                c3.metric("Target Thr.", f"{best['thresh']:.3f}")
+                c4.metric("Entry P",     f"{best['entry']:.2f}")
+                c5.metric("Exit P",      f"{best['exit']:.2f}")
+
+                st.caption("Score = ØSharpe − λ · (Trades / Folds).  Filter: Min. Trades gesamt.")
+                st.dataframe(df_show.head(25), use_container_width=True)
+                st.download_button(
+                    "Optimierergebnisse als CSV",
+                    to_csv_eu(df_res),
+                    file_name="intraday_param_search_results.csv", mime="text/csv"
+                )
+
+
+
 results = []
 all_trades: Dict[str, List[dict]] = {}
 all_feat:  Dict[str, pd.DataFrame] = {}
