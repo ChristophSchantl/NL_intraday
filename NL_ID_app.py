@@ -185,8 +185,11 @@ def _keep_last_n_sessions(df: pd.DataFrame, n: int) -> pd.DataFrame:
     if df.empty:
         return df
     d = df.index.normalize()
-    last_days = d.drop_duplicates().tail(n)
-    return df[d.isin(last_days)].copy()
+    # Reihenfolge-erhaltend und versionssicher (Index hat kein .tail):
+    unique_days = d.unique()                 # ndarray in Originalreihenfolge
+    last_days   = pd.Index(unique_days[-n:]) # letzte n Tage
+    return df.loc[d.isin(last_days)].copy()
+
 
 @st.cache_data(show_spinner=False, ttl=180)
 def get_intraday_past_n_days(ticker: str, interval: str = "5m", days: int = 10, regular_only: bool = True) -> pd.DataFrame:
