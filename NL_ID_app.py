@@ -250,7 +250,15 @@ def make_features(df: pd.DataFrame, lookback_bars: int, horizon_bars: int) -> pd
     feat["FutureRet"] = feat["Close"].shift(-horizon_bars) / feat["Close"] - 1
     return feat
 
-def predict_walk_forward(...):
+def predict_walk_forward(
+    feat: pd.DataFrame,
+    X_cols: List[str],
+    threshold: float,
+    model_params: dict,
+    refit_every: int = 200,
+    min_train: int = 200,
+    calibrate: bool = True
+) -> pd.DataFrame:
     probs = np.full(len(feat), np.nan)
     start = max(min_train, len(X_cols) + 10)
     scaler = None
@@ -260,7 +268,7 @@ def predict_walk_forward(...):
     for i in range(start, len(feat)):
         if (i == start) or (i % refit_every == 0):
             hist = feat.iloc[:i].dropna(subset=X_cols + ["FutureRet"]).copy()
-            # Guard: Inf/NaN entfernen
+            # NaN/Inf säubern
             hist[X_cols] = hist[X_cols].replace([np.inf, -np.inf], np.nan)
             hist = hist.dropna(subset=X_cols + ["FutureRet"])
             if len(hist) < start:
@@ -268,7 +276,7 @@ def predict_walk_forward(...):
 
             y = (hist["FutureRet"] > threshold).astype(int).values
             if len(np.unique(y)) < 2:
-                # keine Varianz → kein Refit
+                # keine Varianz → kein Refit möglich
                 probs[i] = probs[i-1] if i > 0 and np.isfinite(probs[i-1]) else 0.5
                 continue
 
@@ -281,8 +289,7 @@ def predict_walk_forward(...):
                     model = CalibratedClassifierCV(base, cv=3, method="isotonic")
                     model.fit(Xs, y)
                 except ValueError:
-                    # Fallback ohne Kalibrierung
-                    model = base.fit(Xs, y)
+                    model = base.fit(Xs, y)  # Fallback ohne Kalibrierung
             else:
                 model = base.fit(Xs, y)
 
@@ -292,6 +299,7 @@ def predict_walk_forward(...):
 
     feat["SignalProb"] = pd.Series(probs, index=feat.index).ffill().fillna(0.5)
     return feat
+
 
 
 def backtest_next_bar(
