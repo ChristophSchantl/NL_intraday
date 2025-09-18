@@ -522,8 +522,9 @@ with st.spinner(f"Lade Intraday-Daten (RTH) für {len(TICKERS)} Ticker …"):
             if df is None or df.empty:
                 st.warning(f"Keine Intraday-Daten für {tk} ({INTRA_INTERVAL})."); continue
             need = ["Open","High","Low","Close"]
-            if not set(need).subset(df.columns):
+            if not set(need).issubset(df.columns):
                 raise ValueError(f"OHLC unvollständig für {tk}")
+
             price_map[tk] = df
         except Exception as e:
             st.error(f"Fehler beim Laden von {tk}: {e}")
